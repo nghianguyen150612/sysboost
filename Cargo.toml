@@ -1,0 +1,22 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/sysboost-core",
+    "crates/sysboost-platform",
+    "crates/sysboost-config",
+    "crates/sysboost-linux",
+    "crates/sysboost-protocol",
+    "crates/sysboost-testkit",
+    "crates/sysboost-controller",
+    "crates/sysboost-privd",
+]
+
+[workspace.package]
+edition = "2021"
+version = "0.1.0"
+license = "MIT"
+authors = ["Nguyen Nghia"]
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+

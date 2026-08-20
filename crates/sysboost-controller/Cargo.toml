@@ -1,0 +1,17 @@
+[package]
+name = "sysboost-controller"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+sysboost-config = { path = "../sysboost-config" }
+sysboost-core = { path = "../sysboost-core" }
+sysboost-linux = { path = "../sysboost-linux" }
+sysboost-platform = { path = "../sysboost-platform" }
+sysboost-protocol = { path = "../sysboost-protocol" }
+
+[lints]
+workspace = true
+
