@@ -2,7 +2,7 @@
 
 use core::fmt;
 
-use sysboost_core::{ErrorCode, SysboostError};
+use sysboost_core::{ErrorCode, SysboostError, TargetIdentity};
 
 /// A validated relative path used by a non-privileged read port.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -94,6 +94,17 @@ pub trait ReadOnlyFileSystem {
 
     /// Read metadata for a validated relative node.
     fn metadata(&self, path: &RelativePath) -> Result<FileMetadata, SysboostError>;
+
+    /// Return backend-owned identity evidence for an existing node when the
+    /// adapter can prove it.  Mutation-capable backends must not infer a
+    /// target identity from an untrusted path string alone.
+    fn identity(&self, path: &RelativePath) -> Result<TargetIdentity, SysboostError> {
+        let _ = path;
+        Err(SysboostError::new(
+            ErrorCode::Unsupported,
+            "filesystem adapter cannot prove node identity",
+        ))
+    }
 
     /// Enumerate one approved directory without following symlinks.
     ///

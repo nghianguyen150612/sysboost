@@ -4,10 +4,11 @@
 utility. Its primary safety invariant is exact restoration of the state that
 existed before a boost session.
 
-The architecture is frozen, the Rust foundation is implemented, and read-only
-Linux capability discovery is available. No runtime tuning implementation
-exists yet. The production boundaries, mutation contracts, transaction model,
-safety rules, and test virtualization requirements are documented in:
+The architecture is frozen, the Rust foundation, read-only Linux capability
+discovery, transaction/privilege boundaries, reviewed typed CPU/workload
+backends, and conservative topology-aware runtime soft-isolation planning are
+implemented. The production boundaries, mutation contracts, transaction
+model, safety rules, and test virtualization requirements are documented in:
 
 - [Architecture](docs/ARCHITECTURE.md)
 - [Safety](docs/SAFETY.md)

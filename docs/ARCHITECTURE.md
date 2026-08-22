@@ -1,6 +1,6 @@
 # sysboost architecture
 
-Status: **frozen contract; safe Rust foundation and read-only discovery implemented; runtime tuning deferred**
+Status: **frozen contract; safe Rust foundation, read-only discovery, transaction engine, transport-neutral privilege boundary, reviewed typed CPU/workload backends, and conservative topology-aware soft-isolation planning implemented; unsupported runtime families remain deferred**
 Decision version: `0.1`
 Audit baseline: repository commit `070ffef` (`Initial commit`)
 Scope: runtime-only Linux performance changes with exact pre-boost restoration
@@ -49,10 +49,11 @@ interfaces.
 
 ### Non-goals for this architecture freeze
 
-There is no CPU, GPU, IRQ, scheduler, sysctl, bootloader, firmware, or cgroup
-tuning implementation in the current foundation. Boot-time configuration is
-outside the runtime transaction. No shell-command-based privilege mechanism is
-permitted.
+There is no GPU, IRQ, sysctl, bootloader, or firmware implementation in the
+current foundation. Prompt 7 adds the reviewed typed CPU power-policy backend
+and Prompt 8 adds the reviewed typed scheduler/cgroup-v2 workload backend.
+Boot-time configuration is outside the runtime transaction. No shell-command-
+based privilege mechanism is permitted.
 
 ## 3. Target workspace and dependency direction
 
@@ -129,7 +130,7 @@ user / operator
 sysboost-controller (normally unprivileged)
   detect -> plan -> request session -> observe status
       |
-      | versioned Unix-domain protocol; peer credentials checked
+      | authenticated typed local-IPC adapter (composition-root responsibility)
       v
 sysboost-privd (small root-owned service)
   re-detect -> validate -> snapshot -> durable intent
@@ -158,6 +159,20 @@ Running the controller as root does not create a direct arbitrary-write mode.
 The same typed service boundary is used. A report-only mode may run without
 `sysboost-privd`; mutation is unavailable in that mode.
 
+Prompt 6 implementation note: `sysboost-platform::PrivilegeService` is the
+transport-neutral helper admission and lifecycle core. It accepts a typed
+request frame only together with peer identity supplied by its composition
+root; it does not derive identity from request bytes, open a socket, or expose
+an arbitrary filesystem-write primitive. A production Unix-domain adapter
+remains responsible for validating the endpoint's ownership and mode and for
+obtaining authenticated kernel peer credentials (for example, `SO_PEERCRED`)
+before constructing the strong PID/start/boot identity passed to the service.
+The reviewed CPU and workload backends supply the mutation implementations, but
+`sysboost-privd` remains report-only until a production Unix-domain adapter and
+composition-root registration bind the backends to `PrivilegeService`. The
+backends are exercised through that service and the transaction engine in the
+contract tests; no controller-side CPU, scheduler, or cgroup write path exists.
+
 ## 5. Capability model
 
 Capability detection is evidence-based. A model name, distribution name, or
@@ -177,6 +192,13 @@ cpu.policy.energy_preference
 cgroup.cpu.weight
 cgroup.cpu.max
 cgroup.cpuset.cpus
+cgroup.io.weight
+cgroup.uclamp
+cgroup.workload
+cgroup.background
+scheduler.process.placement
+scheduler.nice
+scheduler.ioprio
 gpu.performance.profile
 gpu.power.limit
 irq.affinity
@@ -230,10 +252,13 @@ kernel/runtime facts, typed CPUFreq policy observations, topology/capacity,
 NUMA, cgroup, GPU, IRQ, memory, scheduler, and service-presence facts. Its
 capability matrix distinguishes supported observations, unavailable
 interfaces, permission-denied reads, present-but-unsupported interfaces,
-report-only facts, and indeterminate evidence. The core `CapabilityInventory`
-projection deliberately remains `ReadOnly` for all detected interfaces;
-discovery never claims the `Available` state because no mutation backend,
-preimage, or readback admission has been established.
+report-only facts, and indeterminate evidence. The discovery operation itself
+remains strictly read-only. CPU and workload capability descriptors may project
+as `Available` only for the reviewed `linux.cpu` or `linux.workload` backends,
+and only when the detected interface has a typed current value and a proven
+target identity. Other detected interfaces remain `ReadOnly` or unsupported
+until a reviewed backend supplies preimage, apply, readback, and restore
+admission.
 
 ### 5.3 Feature classification freeze
 
@@ -245,19 +270,31 @@ whether a Linux file happens to be writable.
 | CPUFreq policy governor | Runtime mutable | First-class only for a detected, readable/writable policy with reversible readback. |
 | CPUFreq policy min/max frequency | Runtime mutable | One policy target; validate min/max ordering and snapshot both if the backend treats them as a compound unit. |
 | CPU energy-performance preference | Runtime mutable | Only with a backend-declared exact equality rule and bounded enum/value. |
-| Cgroup CPU weight/quota | Runtime mutable | Runtime mutable only when the cgroup controller is detected, writable, and exactly restorable; existing cgroups only in the first implementation. |
+| CPU boost/turbo (`boost` or `no_turbo`) | Runtime mutable | One detected host-wide interface, normalized to a typed enabled/disabled state and pinned to its target identity. |
+| ACPI platform profile | Conditional | Only for a kernel-advertised profile choice with exact typed restore and stable node identity. |
+| Cgroup CPU weight/quota | Runtime mutable | Runtime mutable only when the cgroup controller is detected, writable, and exactly restorable. |
 | Cgroup cpuset | Conditional | Requires a valid effective CPU set, parent constraints, and an exact set snapshot. No implicit cgroup creation. |
+| Cgroup IO weight | Conditional | Requires the v2 `io` controller, explicit opt-in, and exact typed readback/restore. |
+| Cgroup uclamp min/max | Conditional | Requires the v2 `cpu` controller and separate typed min/max operations with exact readback/restore. |
+| Workload/conservative-background cgroups | Conditional | Only explicit, bounded names under an approved parent may be created and cleaned up; no arbitrary hierarchy management. |
+| Explicit process placement | Conditional | Requires a validated PID plus start-time identity and an explicitly selected destination cgroup. |
+| Process nice | Runtime mutable | Bounded `-20..19` nice values for explicitly identified processes; every change is transactional and restorable. |
+| Conservative process I/O priority | Experimental | Only typed `none`, `best-effort`, and `idle` classes with bounded levels; real-time I/O priority is excluded. |
 | Runtime kernel sysctl family | Conditional | Explicit allowlist only; each key is its own reviewed capability. No generic `/proc/sys` writer. |
 | CPU online/offline | Experimental | High blast radius; disabled by default, separate explicit policy, and never part of a normal boost plan. |
 | GPU performance profile/power limit | Experimental | Backend/device-specific; no fallback to vendor tools or shell commands. Disabled unless a reviewed backend and exact restore contract exist. |
 | IRQ affinity | Experimental | Requires complete IRQ/cpu-set snapshot and ownership/conflict handling; disabled by default. |
-| Scheduler policy/priority changes | Experimental | Only for explicitly owned processes/cgroups; no implicit mutation of unrelated processes. |
+| Scheduler policy/priority changes | Experimental | Prompt 8 implements only the explicit nice/ioprio/placement forms above; it never requests `SCHED_FIFO` or `SCHED_RR` and never classifies processes by name. |
 | Kernel command line, bootloader, initramfs, module parameters requiring reboot | Boot-only/report-only | The runtime utility reports these as possible configuration opportunities; it never edits them. |
 | Firmware, BIOS/UEFI, microcode selection, kernel build options | Boot-only/report-only | Report only. They are outside the runtime transaction and restoration scope. |
 
 Unimplemented or experimental features must not be enabled merely because a
 matching file exists. Every feature starts as report-only until its backend,
-tests, and safety review are complete.
+tests, and safety review are complete. The reviewed CPU backend owns only the
+closed operations `cpu.frequency`, `cpu.governor`, `cpu.energy_preference`,
+`cpu.boost`, and `platform.profile`; the reviewed workload backend owns only
+the closed cgroup-v2 and explicit-process operations listed above. Neither
+backend exposes a generic sysfs, procfs, or cgroupfs writer.
 
 ## 6. Typed mutation model
 
@@ -293,6 +330,14 @@ MutationKind::CpuEnergyPreference { policy: CpuPolicyId, value: EnergyPreference
 MutationKind::CgroupCpuWeight { cgroup: CgroupId, weight: CpuWeight }
 MutationKind::CgroupCpuMax { cgroup: CgroupId, quota: CpuQuota, period: CpuPeriod }
 MutationKind::CgroupCpuset { cgroup: CgroupId, cpus: CpuSet }
+MutationKind::CgroupIoWeight { cgroup: CgroupId, weight: IoWeight }
+MutationKind::CgroupUclampMin { cgroup: CgroupId, value: UclampValue }
+MutationKind::CgroupUclampMax { cgroup: CgroupId, value: UclampValue }
+MutationKind::CgroupWorkload { parent: CgroupId, name: CgroupName }
+MutationKind::CgroupBackground { parent: CgroupId, name: CgroupName }
+MutationKind::ProcessPlacement { process: ProcessId, cgroup: CgroupId }
+MutationKind::ProcessNice { process: ProcessId, nice: NiceValue }
+MutationKind::ProcessIoPriority { process: ProcessId, priority: IoPriority }
 MutationKind::GpuPerformanceProfile { device: GpuId, profile: GpuProfile }
 MutationKind::GpuPowerLimit { device: GpuId, milliwatts: PowerMilliwatts }
 MutationKind::IrqAffinity { irq: IrqId, cpus: CpuSet }
@@ -405,6 +450,13 @@ it makes the definition of the original state ambiguous.
 
 The helper owns the authoritative session state. The controller receives a
 handle and status, not authority to edit the journal or supply restore data.
+
+Runtime state is held below the configured runtime root only after ownership,
+exact mode, regular-file type, link count, and no-symlink checks pass. The
+production root is `/run/sysboost`, owned by the expected privileged UID/GID
+with mode `0700`; state and lock files are expected to be regular, single-link
+files with mode `0600`. Lock ownership is bound to PID, process start
+identity, and boot identity, so a reused PID cannot authorize stale ownership.
 
 ### 8.2 State machine
 
@@ -578,18 +630,64 @@ CgroupProvider::read_cpu_max(CgroupId)
 CgroupProvider::apply_cpu_max(CgroupId, CpuQuota, CpuPeriod)
 CgroupProvider::read_cpuset(CgroupId)
 CgroupProvider::apply_cpuset(CgroupId, CpuSet)
+CgroupProvider::read_io_weight(CgroupId)
+CgroupProvider::apply_io_weight(CgroupId, IoWeight)
+CgroupProvider::read_uclamp(CgroupId, UclampBound)
+CgroupProvider::apply_uclamp(CgroupId, UclampBound, UclampValue)
+CgroupProvider::create_managed_group(CgroupId, CgroupName, CgroupGroupKind)
+CgroupProvider::remove_managed_group(CgroupId, CgroupName, CgroupGroupKind)
+ProcessProvider::read_placement(ProcessId)
+ProcessProvider::apply_placement(ProcessId, CgroupId)
+ProcessProvider::read_nice(ProcessId)
+ProcessProvider::apply_nice(ProcessId, NiceValue)
+ProcessProvider::read_ioprio(ProcessId)
+ProcessProvider::apply_ioprio(ProcessId, IoPriority)
 ```
 
-The initial implementation operates on existing cgroups only. It does not
-create, move, freeze, or delete arbitrary cgroups. A `CgroupId` binds the
-mount identity, validated relative identity, and inode/identity evidence where
-available. The helper revalidates the cgroup and controller availability at
-snapshot and apply time. Parent/effective CPU-set constraints are checked
-before planning and again before applying. v1 and v2 are separate backend
-variants; no path-shaped compatibility shim is allowed to blur their
-semantics.
+The workload backend operates on discovered v2 cgroups and may create or
+remove only an explicitly named managed workload/background child under an
+approved parent. It may move only an explicitly identified process, using the
+PID plus start-time identity; it never scans or classifies arbitrary processes.
+A `CgroupId` binds the mount identity, validated relative identity, and
+inode/identity evidence where available. The helper revalidates the cgroup,
+process identity, controller availability, and current value at snapshot,
+apply, verify, and restore time. Lifecycle cleanup requires an empty managed
+group with no nested groups. v1 and v2 are separate backend variants; no
+path-shaped compatibility shim is allowed to blur their semantics.
 
-### 10.3 Virtualization contract
+### 10.3 CPU topology and runtime soft isolation
+
+Prompt 9 adds a pure CPU placement planner over the read-only topology facts
+already collected by discovery. The planner:
+
+- parses the kernel's possible/online CPU lists and rejects a plan when the
+  online set is unavailable;
+- groups SMT siblings into one physical-core planning unit when package/core
+  or sibling metadata is available;
+- classifies performance and efficiency groups only when every online CPU has
+  positive, distinct kernel capacity values such as `cpu_capacity`;
+- treats homogeneous or incomplete capacity evidence as homogeneous/unknown
+  and uses deterministic CPU order instead of guessing P-core/E-core identity;
+- reserves at least half of the physical-core groups for shared housekeeping
+  work, including kernel, compositor/display, audio, networking, GPU helpers,
+  and system services;
+- emits canonical workload and housekeeping `CpuSet` values plus generated
+  affinity-mask bytes for planning and dry-run inspection; and
+- captures a topology revision and online set that must match at the final
+  pre-apply gate. A changed topology or target identity fails closed rather
+  than recomputing placement.
+
+`--prefer-performance-cores` is a planning preference only. It orders
+kernel-proven performance groups first; it is a no-op with an explicit
+homogeneous/unknown fallback when capacity evidence cannot prove a
+heterogeneous topology. The selected workload set can be submitted only as
+the existing typed `MutationKind::CgroupCpuset` operation through the approved
+planner -> privilege -> transaction -> workload-backend path. Affinity masks
+are generated data, not a direct `sched_setaffinity` mutation API. Boot-time
+isolation features (`isolcpus=`, `nohz_full=`, and `rcu_nocbs=`) remain outside
+the runtime utility.
+
+### 10.4 Virtualization contract
 
 Every backend must run against a `sysboost-testkit` fixture that can model:
 
@@ -619,10 +717,10 @@ Planner
 MutationBackend
   descriptor() -> BackendDescriptor
   detect(context) -> BackendInventory
-  snapshot(mutation) -> Snapshot
-  apply(mutation, snapshot) -> ApplyReceipt
-  verify(mutation, expected) -> Verification
-  restore(mutation, snapshot) -> RestoreReceipt
+  snapshot(execution_token, mutation) -> Snapshot
+  apply(execution_token, mutation, snapshot) -> ApplyReceipt
+  verify(execution_token, mutation, expected) -> Verification
+  restore(execution_token, mutation, snapshot) -> RestoreReceipt
 
 JournalStore
   create_intent(session, plan, snapshots)
@@ -637,9 +735,13 @@ PrivilegeBroker
 ```
 
 The Rust traits may split these methods for borrow-checking and stage safety,
-but the semantics must remain. `MutationBackend::apply` cannot be callable
-unless a durable intent and complete snapshot are present; this should be
-represented in types or stage-specific handles where practical.
+but the semantics must remain. `MutationBackend` snapshot/apply/verify/restore
+calls require an unforgeable `BackendExecutionToken` held only by
+`TransactionEngine`, so a backend cannot be driven directly around durable
+intent and complete-snapshot admission. The Linux CPU and workload backends
+keep their writable adapters private and expose only read-only inspection
+views; their typed mutation implementations are reached through that
+token-gated port.
 
 `BackendDescriptor` declares backend ID/version, capability IDs, target kinds,
 supported equality, maximum encoded sizes, risk, and feature classification.

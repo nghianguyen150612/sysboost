@@ -55,8 +55,9 @@ impl CgroupTarget {
     }
 }
 
-/// Read-only cgroup adapter. Mutation methods belong to a future reviewed
-/// backend and are deliberately absent from this skeleton.
+/// Read-only cgroup adapter. Mutation methods belong to the reviewed
+/// [`crate::WorkloadBackend`] and are deliberately absent from this generic
+/// discovery facade.
 #[derive(Clone, Debug)]
 pub struct CgroupAccess<F> {
     filesystem: F,

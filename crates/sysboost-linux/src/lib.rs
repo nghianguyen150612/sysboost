@@ -3,18 +3,25 @@
 
 //! Linux adapters and fake-root fixtures.
 //!
-//! This skeleton only reads through typed nodes. Runtime mutation backends are
-//! intentionally not implemented here.
+//! Runtime mutation is limited to the reviewed typed CPU and scheduler/cgroup
+//! workload backends; all other Linux facilities remain report-only.
 
 pub mod backend;
 pub mod cgroup;
+pub mod cpu;
 pub mod discovery;
 pub mod fs;
 pub mod procfs;
 pub mod sysfs;
+pub mod topology;
+pub mod workload;
 
 pub use backend::ReportOnlyBackend;
 pub use cgroup::{CgroupAccess, CgroupFile, CgroupTarget, CgroupVersion};
+pub use cpu::{
+    cpu_operation_catalog, CpuBackend, CpuBoostInterface, CpuFixture, CpuInspection, CpuNode,
+    CpuNodeState, CPU_BACKEND_ID,
+};
 pub use discovery::{
     CapabilityDiscovery, CapabilityFinding, CpuFreqFacts, CpuFreqPolicyFacts, CpuTopologyEntry,
     CpuTopologyFacts, DiscoveryReport, DiscoverySources, DiscoveryStatus, EnvironmentFacts,
@@ -24,6 +31,24 @@ pub use discovery::{
 pub use fs::{FixtureFilesystem, RootedFilesystem};
 pub use procfs::{ProcfsAccess, ProcfsNode};
 pub use sysfs::{SysfsAccess, SysfsNode};
+pub use topology::{
+    parse_cpu_list, CpuAffinityMask, CpuCapacityMode, CpuCoreGroup, CpuIsolationPlan,
+    CpuIsolationPlanner, CpuPerformanceClass, CpuPlacementFallback, CpuPlacementPolicy,
+    CpuSelectionPolicy, CpuTopology, CpuTopologyCpu, CpuTopologyPlanner, TopologyRevision,
+    CPU_ISOLATION_OUTPUT_GATE, PREFER_PERFORMANCE_CORES_FLAG,
+};
+pub use workload::{
+    workload_operation_catalog, CgroupFixture, ChildProcessSupervisor, WorkloadBackend,
+    WorkloadInspection, WorkloadNode, WorkloadTarget, WORKLOAD_BACKEND_ID,
+};
+
+/// Return the combined closed-operation catalog for the reviewed Linux CPU
+/// and scheduler/workload backends.
+pub fn linux_operation_catalog() -> sysboost_core::OperationCatalog {
+    let mut contracts = cpu_operation_catalog().contracts().to_vec();
+    contracts.extend(workload_operation_catalog().contracts().iter().cloned());
+    sysboost_core::OperationCatalog::new(contracts)
+}
 
 #[cfg(test)]
 mod tests {

@@ -1,6 +1,6 @@
 # sysboost safety contract
 
-Status: **frozen safety contract; foundation and read-only discovery implemented; runtime mutation deferred**
+Status: **frozen safety contract; foundation, read-only discovery, transaction engine, transport-neutral privilege boundary, and reviewed typed CPU/workload backends implemented; unsupported runtime mutation remains deferred**
 This document states the safety properties that every future implementation
 and backend must satisfy. It is intentionally operational: if a proposed
 feature cannot meet these rules, it is report-only until the contract changes
@@ -149,7 +149,9 @@ capability IDs, target IDs, lengths, enum discriminants, and policy digests.
 The helper is a small root-owned service with:
 
 - a root-owned executable and journal directory;
-- a Unix socket with restrictive ownership/mode and peer-credential checks;
+- a local IPC endpoint with restrictive ownership/mode and authenticated peer
+  credentials; the Prompt 6 service core receives that identity from its
+  composition root and does not trust identity fields in request bytes;
 - protocol version, maximum frame length, timeout, and request-rate limits;
 - session nonce/ownership checks to prevent replay or cross-session use;
 - compiled-in operation and target validation;
@@ -162,6 +164,33 @@ compatible with the supported kernel (minimal supplementary groups/capability
 set, private runtime files, restrictive umask, and an appropriate syscall
 filter). Hardening must not be treated as a substitute for typed API
 validation.
+
+The runtime-state trust boundary is equally strict. `/run/sysboost` must be
+the expected non-symlink directory with the expected owner and exact `0700`
+mode. Session state and lock files must be expected-owner regular files with
+exact `0600` mode and a single hard link; symlinks, directories, device nodes,
+unexpected pre-existing objects, and stale state owned by another identity are
+rejected. Lock metadata binds PID to process-start and boot identities, and
+stale recovery removes a lock only after rechecking its file identity. Durable
+state replacement remains `write temporary state -> sync file -> atomic rename
+-> sync directory`.
+
+Prompt 7 adds the reviewed CPU mutation backend: `sysboost-linux::CpuBackend`.
+Prompt 8 adds `sysboost-linux::WorkloadBackend` for closed cgroup-v2 and
+explicit-process operations. Both backends require the transaction execution
+token for mutation and are admitted through `PrivilegeService`.
+It accepts only typed policy/system nodes, derives fixed kernel interface paths
+from `CpuPolicyId` and closed system-operation enums, rejects symlinks and
+unexpected object types, captures dev/inode target identity, and revalidates
+that identity at snapshot, apply, verify, and restore. The backend is tested
+through `PrivilegeService` and `TransactionEngine`; it does not add a
+controller-side write path. Its writable CPU adapter is private, the public
+backend inspection API is read-only, and transaction-stage backend calls
+require a token that only `TransactionEngine` can construct. A Unix-domain
+listener must still be added at the composition root with endpoint
+ownership/mode validation and kernel peer authentication before production use.
+Until that listener and explicit composition-root registration are enabled,
+`sysboost-privd` remains a report-only bootstrap.
 
 ### 6.3 Kernel pseudo-filesystems
 
@@ -192,8 +221,7 @@ command, or “write arbitrary key” field.
 Risk defaults are:
 
 - report-only for boot/firmware/kernel-build features;
-- opt-in for experimental GPU, IRQ, CPU online/offline, and scheduler
-  families;
+- opt-in for experimental GPU, IRQ, CPU online/offline, and scheduler families;
 - optional and capability-gated for conditional cgroup/sysctl families; and
 - no mutation when exact snapshot or readback is unavailable.
 
@@ -202,17 +230,31 @@ Risk defaults are:
 The authoritative classification is in
 [ARCHITECTURE.md](ARCHITECTURE.md). In summary:
 
-- **Runtime mutable**: reviewed CPUFreq and selected cgroup operations with
-  exact snapshot/restore.
+- **Runtime mutable**: reviewed CPUFreq governor, EPP, frequency-range,
+  boost/turbo, platform-profile, and bounded process-nice operations with exact
+  snapshot/restore.
 - **Conditional**: operations whose availability, controller topology, or
-  kernel semantics must be detected on each host.
-- **Experimental**: GPU, IRQ affinity, CPU online/offline, and scheduler
-  families; disabled by default and separately gated.
+  kernel semantics must be detected on each host, including cgroup CPU/IO/
+  uclamp controls, managed workload groups, explicit process placement, and
+  topology-aware cpuset placement.
+- **Experimental**: GPU, IRQ affinity, CPU online/offline, and conservative
+  process ioprio; disabled by default and separately gated. No real-time
+  scheduler policy (`SCHED_FIFO` or `SCHED_RR`) is exposed.
 - **Boot-only/report-only**: bootloader, kernel command line, initramfs,
   firmware/BIOS, microcode selection, and kernel build configuration.
 
 The classification is not permission to implement a feature. It is the safety
 policy that implementation must satisfy.
+
+Prompt 9 runtime soft isolation is deliberately conservative. It never
+allocates every online CPU to a workload, keeps a housekeeping set for
+kernel/compositor/audio/network/GPU-helper/system work, and does not emulate
+boot-time isolation. A `--prefer-performance-cores` request is honored only
+when online kernel capacity metadata proves heterogeneous capacity; otherwise
+the planner reports a homogeneous/unknown fallback and uses deterministic
+online topology. The planned CPU set and backend target identity are compared
+again immediately before mutation. Any online/topology/identity change fails
+the plan and leaves rollback to the existing transaction engine.
 
 ## 9. Test obligations
 
@@ -225,7 +267,10 @@ Safety tests must prove behavior without changing the developer host:
 - external-change conflict tests;
 - idempotent reverse rollback tests;
 - protocol fuzzing and authorization tests; and
-- path traversal and command-injection negative tests.
+- path traversal and command-injection negative tests;
+- homogeneous, SMT, hybrid-capacity, sparse/offline, NUMA, insufficient-CPU,
+  and missing-capacity topology fixtures; and
+- online-set/topology revision and target-identity revalidation tests.
 
 Any future opt-in real-host lab test must be isolated, clearly marked, and
 never required for ordinary builds or CI.

@@ -8,7 +8,10 @@ authors.workspace = true
 [dependencies]
 sysboost-core = { path = "../sysboost-core" }
 sysboost-platform = { path = "../sysboost-platform" }
+sysboost-protocol = { path = "../sysboost-protocol" }
+
+[dev-dependencies]
+sysboost-linux = { path = "../sysboost-linux" }
 
 [lints]
 workspace = true
-

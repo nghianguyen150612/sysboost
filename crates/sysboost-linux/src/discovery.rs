@@ -10,14 +10,19 @@ use std::collections::BTreeMap;
 
 use sysboost_core::capability::ids as core_capability_ids;
 use sysboost_core::{
+    fingerprint_for_value, CgroupId, CpuPeriod, CpuPolicyId, CpuQuota, CpuSet, CurrentState,
+    CurrentStateFact, EnergyPreference, PlanValue, TypedTarget, TypedValue,
+};
+use sysboost_core::{
     BackendId, CapabilityDescriptor, CapabilityEvidence, CapabilityId, CapabilityInventory,
-    CapabilityState, EqualityKind, EvidenceSource, FeatureClass, PrivilegeRequirement, RiskClass,
-    TargetId, TargetKind,
+    CapabilityState, EqualityKind, EvidenceSource, FeatureClass, OperationDescriptor,
+    PrivilegeRequirement, RiskClass, TargetId, TargetKind,
 };
 use sysboost_core::{ErrorCode, SysboostError, Timestamp};
 use sysboost_platform::{Clock, DirectoryEntry, EntryKind, ReadOnlyFileSystem, RelativePath};
 
 use crate::cgroup::CgroupVersion;
+use crate::cpu::CpuBoostInterface;
 use crate::fs::RootedFilesystem;
 
 /// Stable report-only capability names used by the Linux discovery matrix.
@@ -219,6 +224,8 @@ pub struct CpuFreqPolicyFacts {
     pub current_khz: Option<u64>,
     /// Names of policy files that could not be read or parsed.
     pub read_failures: Vec<String>,
+    /// Identity of the policy directory captured by the read-only adapter.
+    pub target_identity: Option<sysboost_core::TargetIdentity>,
 }
 
 /// CPUFreq-wide and platform-profile observations.
@@ -228,10 +235,16 @@ pub struct CpuFreqFacts {
     pub policies: Vec<CpuFreqPolicyFacts>,
     /// Global boost/turbo value when exposed.
     pub boost: Option<String>,
+    /// Which closed kernel boost interface supplied `boost`.
+    pub boost_interface: Option<CpuBoostInterface>,
+    /// Identity of the selected boost interface node.
+    pub boost_target_identity: Option<sysboost_core::TargetIdentity>,
     /// Current platform profile.
     pub platform_profile: Option<String>,
     /// Available platform profiles.
     pub platform_profile_choices: Vec<String>,
+    /// Identity of the platform-profile node.
+    pub platform_profile_target_identity: Option<sysboost_core::TargetIdentity>,
 }
 
 /// One CPU topology record.
@@ -429,6 +442,333 @@ pub struct DiscoveryReport {
     pub inventory: CapabilityInventory,
 }
 
+impl DiscoveryReport {
+    /// Project read-only discovery facts into the planner's typed current-state
+    /// input.  This conversion performs no additional I/O and intentionally
+    /// carries only identities proven by the read-only adapter; the mutation
+    /// backend still revalidates every identity before writing.
+    pub fn current_state(&self) -> Result<CurrentState, SysboostError> {
+        let mut facts = Vec::new();
+        for policy in &self.cpufreq.policies {
+            let target = TargetId::new(format!("cpu.policy.{}", policy.id))
+                .expect("discovery CPU policy target is valid");
+            let typed_target = TypedTarget::CpuPolicy(CpuPolicyId::new(policy.id));
+            if let Some(current) = policy.current_governor.as_ref() {
+                if let Ok(current) = sysboost_core::GovernorId::new(current.clone()) {
+                    let choices = policy
+                        .available_governors
+                        .iter()
+                        .filter_map(|choice| {
+                            sysboost_core::GovernorId::new(choice.clone())
+                                .ok()
+                                .map(|value| PlanValue::Typed(TypedValue::Governor(value)))
+                        })
+                        .collect();
+                    let value = PlanValue::Typed(TypedValue::Governor(current));
+                    facts.push(
+                        CurrentStateFact::known(
+                            core_capability_id(core_capability_ids::CPU_POLICY_GOVERNOR),
+                            target.clone(),
+                            sysboost_core::ControlId::CpuGovernor,
+                            value.clone(),
+                            fingerprint_for_value(&value),
+                        )
+                        .with_supported_values(choices)
+                        .with_optional_target_identity(policy.target_identity)
+                        .with_typed_target(typed_target.clone()),
+                    );
+                }
+            }
+            if let Some(current) = policy.energy_performance_preference.as_ref() {
+                let value = match parse_energy_preference(current) {
+                    Some(value) => PlanValue::Typed(TypedValue::EnergyPreference(value)),
+                    None => PlanValue::Text(
+                        sysboost_core::ObservedText::new(current.clone())
+                            .expect("discovery EPP text is bounded"),
+                    ),
+                };
+                let choices = policy
+                    .energy_performance_choices
+                    .iter()
+                    .filter_map(|choice| {
+                        parse_energy_preference(choice)
+                            .map(|value| PlanValue::Typed(TypedValue::EnergyPreference(value)))
+                    })
+                    .collect();
+                facts.push(
+                    CurrentStateFact::known(
+                        core_capability_id(core_capability_ids::CPU_POLICY_ENERGY_PREFERENCE),
+                        target.clone(),
+                        sysboost_core::ControlId::CpuEnergyPreference,
+                        value.clone(),
+                        fingerprint_for_value(&value),
+                    )
+                    .with_supported_values(choices)
+                    .with_optional_target_identity(policy.target_identity)
+                    .with_typed_target(typed_target.clone()),
+                );
+            }
+            if let (Some(min_khz), Some(max_khz)) = (policy.min_khz, policy.max_khz) {
+                if let (Ok(min_khz), Ok(max_khz)) = (
+                    sysboost_core::FrequencyKHz::new(min_khz),
+                    sysboost_core::FrequencyKHz::new(max_khz),
+                ) {
+                    let value = PlanValue::Typed(TypedValue::CpuFrequency {
+                        min_khz: Some(min_khz),
+                        max_khz: Some(max_khz),
+                    });
+                    facts.push(
+                        CurrentStateFact::known(
+                            core_capability_id(core_capability_ids::CPU_POLICY_FREQUENCY_MAX),
+                            target.clone(),
+                            sysboost_core::ControlId::CpuFrequency,
+                            value.clone(),
+                            fingerprint_for_value(&value),
+                        )
+                        .with_optional_target_identity(policy.target_identity)
+                        .with_typed_target(typed_target),
+                    );
+                }
+            }
+        }
+
+        if let (Some(value), Some(interface), Some(identity)) = (
+            self.cpufreq.boost.as_deref(),
+            self.cpufreq.boost_interface,
+            self.cpufreq.boost_target_identity,
+        ) {
+            if let Some(value) = parse_cpu_boost(interface, value) {
+                let value = PlanValue::Typed(TypedValue::CpuBoost(value));
+                facts.push(
+                    CurrentStateFact::known(
+                        core_capability_id(core_capability_ids::CPU_BOOST),
+                        TargetId::new("system.cpu.boost").expect("static CPU target is valid"),
+                        sysboost_core::ControlId::CpuBoost,
+                        value.clone(),
+                        fingerprint_for_value(&value),
+                    )
+                    .with_supported_values(vec![
+                        PlanValue::Typed(TypedValue::CpuBoost(
+                            sysboost_core::CpuBoostState::Enabled,
+                        )),
+                        PlanValue::Typed(TypedValue::CpuBoost(
+                            sysboost_core::CpuBoostState::Disabled,
+                        )),
+                    ])
+                    .with_target_identity(identity)
+                    .with_typed_target(TypedTarget::CpuSystem),
+                );
+            }
+        }
+        if let (Some(value), Some(identity)) = (
+            self.cpufreq.platform_profile.as_deref(),
+            self.cpufreq.platform_profile_target_identity,
+        ) {
+            if let Ok(current) = sysboost_core::PlatformProfileId::new(value.to_owned()) {
+                let current = PlanValue::Typed(TypedValue::PlatformProfile(current));
+                let choices = self
+                    .cpufreq
+                    .platform_profile_choices
+                    .iter()
+                    .filter_map(|choice| {
+                        sysboost_core::PlatformProfileId::new(choice.clone())
+                            .ok()
+                            .map(TypedValue::PlatformProfile)
+                            .map(PlanValue::Typed)
+                    })
+                    .collect();
+                facts.push(
+                    CurrentStateFact::known(
+                        core_capability_id(core_capability_ids::PLATFORM_PROFILE),
+                        TargetId::new("system.platform.profile")
+                            .expect("static platform target is valid"),
+                        sysboost_core::ControlId::PlatformProfile,
+                        current.clone(),
+                        fingerprint_for_value(&current),
+                    )
+                    .with_supported_values(choices)
+                    .with_target_identity(identity)
+                    .with_typed_target(TypedTarget::CpuSystem),
+                );
+            }
+        }
+        if let Some(current) = self.memory.thp_enabled.as_ref() {
+            add_observed_text_fact(
+                &mut facts,
+                &Some(current.clone()),
+                core_capability_ids::MEMORY_THP,
+                "system",
+                sysboost_core::ControlId::TransparentHugePages,
+            );
+        }
+
+        let cgroup_target = TargetId::new("cgroup.current").expect("static cgroup target is valid");
+        let cgroup_identity = CgroupId::new(0, 0, cgroup_target.clone());
+        if let Some(weight) = self
+            .cgroup
+            .cpu_weight
+            .as_deref()
+            .and_then(|value| value.parse::<u16>().ok())
+            .and_then(|value| sysboost_core::CpuWeight::new(value).ok())
+        {
+            let value = PlanValue::Typed(TypedValue::CgroupCpuWeight(weight));
+            facts.push(
+                CurrentStateFact::known(
+                    core_capability_id(core_capability_ids::CGROUP_CPU_WEIGHT),
+                    cgroup_target.clone(),
+                    sysboost_core::ControlId::CgroupCpuWeight,
+                    value.clone(),
+                    fingerprint_for_value(&value),
+                )
+                .with_typed_target(TypedTarget::Cgroup(cgroup_identity.clone())),
+            );
+        }
+        if let Some((quota, period)) = parse_cpu_max(self.cgroup.cpu_max.as_deref()) {
+            let value = PlanValue::Typed(TypedValue::CgroupCpuMax { quota, period });
+            facts.push(
+                CurrentStateFact::known(
+                    core_capability_id(core_capability_ids::CGROUP_CPU_MAX),
+                    cgroup_target.clone(),
+                    sysboost_core::ControlId::CgroupCpuMax,
+                    value.clone(),
+                    fingerprint_for_value(&value),
+                )
+                .with_typed_target(TypedTarget::Cgroup(cgroup_identity.clone())),
+            );
+        }
+        if let Some(cpus) = self.cgroup.cpuset_cpus.as_deref().and_then(parse_cpu_set) {
+            let value = PlanValue::Typed(TypedValue::CgroupCpuset(cpus));
+            facts.push(
+                CurrentStateFact::known(
+                    core_capability_id(core_capability_ids::CGROUP_CPUSET_CPUS),
+                    cgroup_target.clone(),
+                    sysboost_core::ControlId::CgroupCpuset,
+                    value.clone(),
+                    fingerprint_for_value(&value),
+                )
+                .with_typed_target(TypedTarget::Cgroup(cgroup_identity)),
+            );
+        }
+        if let (Some(minimum), Some(maximum)) = (
+            self.cgroup.uclamp_min.as_ref(),
+            self.cgroup.uclamp_max.as_ref(),
+        ) {
+            let value = PlanValue::Text(
+                sysboost_core::ObservedText::new(format!("min={minimum} max={maximum}"))
+                    .expect("cgroup uclamp observation is bounded"),
+            );
+            facts.push(CurrentStateFact::known(
+                core_capability_id(core_capability_ids::CGROUP_UCLAMP),
+                cgroup_target,
+                sysboost_core::ControlId::CgroupUclamp,
+                value.clone(),
+                fingerprint_for_value(&value),
+            ));
+        }
+
+        for irq in &self.irq.entries {
+            let Some(cpus) = irq.affinity.as_deref().and_then(parse_cpu_set) else {
+                continue;
+            };
+            let target =
+                TargetId::new(format!("irq.{}", irq.irq)).expect("discovery IRQ target is valid");
+            let value = PlanValue::Typed(TypedValue::IrqAffinity(cpus));
+            facts.push(
+                CurrentStateFact::known(
+                    core_capability_id(core_capability_ids::IRQ_AFFINITY),
+                    target,
+                    sysboost_core::ControlId::IrqAffinity,
+                    value.clone(),
+                    fingerprint_for_value(&value),
+                )
+                .with_typed_target(TypedTarget::Irq(sysboost_core::IrqId::new(irq.irq))),
+            );
+        }
+
+        CurrentState::new(self.observed_at, facts)
+    }
+}
+
+fn core_capability_id(value: &str) -> CapabilityId {
+    CapabilityId::new(value.to_owned()).expect("static core capability ID is valid")
+}
+
+fn add_observed_text_fact(
+    facts: &mut Vec<CurrentStateFact>,
+    value: &Option<String>,
+    capability: &str,
+    target: &str,
+    control: sysboost_core::ControlId,
+) {
+    let Some(value) = value else {
+        return;
+    };
+    let Ok(value) = sysboost_core::ObservedText::new(value.clone()) else {
+        return;
+    };
+    let value = PlanValue::Text(value);
+    let target = TargetId::new(target.to_owned()).expect("static discovery target is valid");
+    facts.push(CurrentStateFact::known(
+        core_capability_id(capability),
+        target,
+        control,
+        value.clone(),
+        fingerprint_for_value(&value),
+    ));
+}
+
+fn parse_energy_preference(value: &str) -> Option<EnergyPreference> {
+    match value {
+        "performance" => Some(EnergyPreference::Performance),
+        "balance_performance" => Some(EnergyPreference::BalancePerformance),
+        "balance_power" => Some(EnergyPreference::BalancePower),
+        "power" => Some(EnergyPreference::Power),
+        _ => None,
+    }
+}
+
+fn parse_cpu_boost(
+    interface: CpuBoostInterface,
+    value: &str,
+) -> Option<sysboost_core::CpuBoostState> {
+    match (interface, value.trim()) {
+        (CpuBoostInterface::Boost, "1") | (CpuBoostInterface::NoTurbo, "0") => {
+            Some(sysboost_core::CpuBoostState::Enabled)
+        }
+        (CpuBoostInterface::Boost, "0") | (CpuBoostInterface::NoTurbo, "1") => {
+            Some(sysboost_core::CpuBoostState::Disabled)
+        }
+        _ => None,
+    }
+}
+
+fn parse_cpu_max(value: Option<&str>) -> Option<(CpuQuota, CpuPeriod)> {
+    let mut fields = value?.split_whitespace();
+    let quota = match fields.next()? {
+        "max" => CpuQuota::Max,
+        value => CpuQuota::micros(value.parse().ok()?).ok()?,
+    };
+    let period = CpuPeriod::new(fields.next()?.parse().ok()?).ok()?;
+    Some((quota, period))
+}
+
+fn parse_cpu_set(value: &str) -> Option<CpuSet> {
+    let mut cpus = Vec::new();
+    for part in value.split(',') {
+        if let Some((start, end)) = part.split_once('-') {
+            let start = start.trim().parse::<u32>().ok()?;
+            let end = end.trim().parse::<u32>().ok()?;
+            if start > end || end.saturating_sub(start) > 4096 {
+                return None;
+            }
+            cpus.extend(start..=end);
+        } else {
+            cpus.push(part.trim().parse::<u32>().ok()?);
+        }
+    }
+    CpuSet::new(cpus).ok()
+}
+
 /// Read-only capability discovery engine.
 pub struct CapabilityDiscovery<'a> {
     sources: DiscoverySources<'a>,
@@ -460,7 +800,15 @@ impl<'a> CapabilityDiscovery<'a> {
 
         let (cpufreq, cpufreq_findings) = detect_cpufreq(self.sources.sysfs);
         for finding in cpufreq_findings {
-            add_descriptor_for_finding(&mut descriptors, &finding, TargetKind::CpuPolicy);
+            let target_kind = if matches!(
+                finding.id.as_str(),
+                core_capability_ids::CPU_BOOST | core_capability_ids::PLATFORM_PROFILE
+            ) {
+                TargetKind::CpuSystem
+            } else {
+                TargetKind::CpuPolicy
+            };
+            add_descriptor_for_finding(&mut descriptors, &finding, target_kind);
             findings.push(finding);
         }
 
@@ -629,34 +977,19 @@ fn status_for_probes<T>(probes: &[(&Probe<T>, DiscoveryStatus)]) -> DiscoverySta
 }
 
 fn combine_statuses(statuses: &[DiscoveryStatus]) -> DiscoveryStatus {
-    if statuses
-        .iter()
-        .any(|status| *status == DiscoveryStatus::PermissionDenied)
-    {
+    if statuses.contains(&DiscoveryStatus::PermissionDenied) {
         return DiscoveryStatus::PermissionDenied;
     }
-    if statuses
-        .iter()
-        .any(|status| *status == DiscoveryStatus::Indeterminate)
-    {
+    if statuses.contains(&DiscoveryStatus::Indeterminate) {
         return DiscoveryStatus::Indeterminate;
     }
-    if statuses
-        .iter()
-        .any(|status| *status == DiscoveryStatus::Supported)
-    {
+    if statuses.contains(&DiscoveryStatus::Supported) {
         return DiscoveryStatus::Supported;
     }
-    if statuses
-        .iter()
-        .any(|status| *status == DiscoveryStatus::PresentButUnsupported)
-    {
+    if statuses.contains(&DiscoveryStatus::PresentButUnsupported) {
         return DiscoveryStatus::PresentButUnsupported;
     }
-    if statuses
-        .iter()
-        .any(|status| *status == DiscoveryStatus::ReportOnly)
-    {
+    if statuses.contains(&DiscoveryStatus::ReportOnly) {
         return DiscoveryStatus::ReportOnly;
     }
     DiscoveryStatus::Unavailable
@@ -705,8 +1038,23 @@ fn add_descriptor_for_finding(
     finding: &CapabilityFinding,
     target_kind: TargetKind,
 ) {
-    let backend = BackendId::new(DISCOVERY_BACKEND).expect("static backend ID is valid");
+    let cpu_operation = match finding.id.as_str() {
+        core_capability_ids::CPU_POLICY_FREQUENCY_MIN
+        | core_capability_ids::CPU_POLICY_FREQUENCY_MAX => Some("cpu.frequency"),
+        core_capability_ids::CPU_POLICY_GOVERNOR => Some("cpu.governor"),
+        core_capability_ids::CPU_POLICY_ENERGY_PREFERENCE => Some("cpu.energy_preference"),
+        core_capability_ids::CPU_BOOST => Some("cpu.boost"),
+        core_capability_ids::PLATFORM_PROFILE => Some("platform.profile"),
+        _ => None,
+    };
+    let backend = BackendId::new(if cpu_operation.is_some() {
+        crate::cpu::CPU_BACKEND_ID
+    } else {
+        DISCOVERY_BACKEND
+    })
+    .expect("static backend ID is valid");
     let state = match finding.status {
+        DiscoveryStatus::Supported if cpu_operation.is_some() => CapabilityState::Available,
         DiscoveryStatus::Supported
         | DiscoveryStatus::PresentButUnsupported
         | DiscoveryStatus::ReportOnly => CapabilityState::ReadOnly,
@@ -714,14 +1062,33 @@ fn add_descriptor_for_finding(
         DiscoveryStatus::PermissionDenied => CapabilityState::Denied,
         DiscoveryStatus::Indeterminate => CapabilityState::Indeterminate,
     };
+    let operations = cpu_operation
+        .map(|operation| {
+            vec![OperationDescriptor {
+                id: sysboost_core::OperationId::new(operation)
+                    .expect("static CPU operation ID is valid"),
+                privilege: PrivilegeRequirement::PrivilegedMutation,
+                equality: EqualityKind::ScalarExact,
+                classification: finding.classification,
+            }]
+        })
+        .unwrap_or_default();
     descriptors.push(CapabilityDescriptor {
         id: finding.id.clone(),
         backend,
         target_kind,
         state,
-        operations: Vec::new(),
-        privilege: PrivilegeRequirement::ReadOnly,
-        equality: EqualityKind::ByteExact,
+        operations,
+        privilege: if cpu_operation.is_some() {
+            PrivilegeRequirement::PrivilegedMutation
+        } else {
+            PrivilegeRequirement::ReadOnly
+        },
+        equality: if cpu_operation.is_some() {
+            EqualityKind::ScalarExact
+        } else {
+            EqualityKind::ByteExact
+        },
         risk: match finding.classification {
             FeatureClass::RuntimeMutable => RiskClass::Medium,
             FeatureClass::Conditional => RiskClass::Medium,
@@ -881,6 +1248,16 @@ fn probe_value<T: Clone>(probe: Probe<T>) -> Option<T> {
     }
 }
 
+fn probe_identity(
+    filesystem: &dyn ReadOnlyFileSystem,
+    relative_path: &str,
+) -> Option<sysboost_core::TargetIdentity> {
+    filesystem
+        .identity(&path(relative_path))
+        .ok()
+        .filter(|identity| identity.as_bytes() != &[0; 16])
+}
+
 fn detect_cpufreq(sysfs: &dyn ReadOnlyFileSystem) -> (CpuFreqFacts, Vec<CapabilityFinding>) {
     let policy_dir = list(sysfs, Some("devices/system/cpu/cpufreq"));
     let policy_ids = match &policy_dir {
@@ -892,12 +1269,24 @@ fn detect_cpufreq(sysfs: &dyn ReadOnlyFileSystem) -> (CpuFreqFacts, Vec<Capabili
 
     let boost = read_text(sysfs, "devices/system/cpu/cpufreq/boost");
     let no_turbo = read_text(sysfs, "devices/system/cpu/cpufreq/no_turbo");
-    let boost_probe = if matches!(boost, Probe::Present(_)) {
+    let boost_interface = if matches!(boost, Probe::Present(_)) {
+        Some(CpuBoostInterface::Boost)
+    } else if matches!(no_turbo, Probe::Present(_)) {
+        Some(CpuBoostInterface::NoTurbo)
+    } else {
+        None
+    };
+    let boost_probe = if matches!(boost_interface, Some(CpuBoostInterface::Boost)) {
         &boost
     } else {
         &no_turbo
     };
     facts.boost = probe_value(boost.clone()).or_else(|| probe_value(no_turbo.clone()));
+    facts.boost_interface = boost_interface;
+    facts.boost_target_identity = boost_interface.and_then(|interface| match interface {
+        CpuBoostInterface::Boost => probe_identity(sysfs, "devices/system/cpu/cpufreq/boost"),
+        CpuBoostInterface::NoTurbo => probe_identity(sysfs, "devices/system/cpu/cpufreq/no_turbo"),
+    });
     add_finding(
         &mut findings,
         ids::CPU_BOOST,
@@ -917,6 +1306,8 @@ fn detect_cpufreq(sysfs: &dyn ReadOnlyFileSystem) -> (CpuFreqFacts, Vec<Capabili
     let platform_profile = read_text(sysfs, "firmware/acpi/platform_profile");
     let platform_choices = read_text(sysfs, "firmware/acpi/platform_profile_choices");
     facts.platform_profile = probe_value(platform_profile.clone());
+    facts.platform_profile_target_identity =
+        probe_identity(sysfs, "firmware/acpi/platform_profile");
     facts.platform_profile_choices = match platform_choices.clone() {
         Probe::Present(value) => parse_tokens(&value),
         Probe::Missing | Probe::Denied | Probe::Malformed => Vec::new(),
@@ -968,6 +1359,7 @@ fn detect_cpufreq(sysfs: &dyn ReadOnlyFileSystem) -> (CpuFreqFacts, Vec<Capabili
 
     for policy_id in policy_ids {
         let prefix = format!("devices/system/cpu/cpufreq/policy{policy_id}");
+        let target_identity = probe_identity(sysfs, &prefix);
         let related = read_text(sysfs, &format!("{prefix}/related_cpus"));
         let driver = read_text(sysfs, &format!("{prefix}/scaling_driver"));
         let available_governors =
@@ -998,6 +1390,7 @@ fn detect_cpufreq(sysfs: &dyn ReadOnlyFileSystem) -> (CpuFreqFacts, Vec<Capabili
             max_khz: probe_value(max.clone()),
             current_khz: probe_value(current.clone()),
             read_failures: Vec::new(),
+            target_identity,
         };
         for (name, probe) in [
             ("related_cpus", &related),
@@ -1084,7 +1477,10 @@ fn detect_cpufreq(sysfs: &dyn ReadOnlyFileSystem) -> (CpuFreqFacts, Vec<Capabili
             &mut findings,
             core_capability_ids::CPU_POLICY_ENERGY_PREFERENCE,
             Some(&target),
-            status(&epp, DiscoveryStatus::Supported),
+            status_for_probes(&[
+                (&epp, DiscoveryStatus::Supported),
+                (&epp_choices, DiscoveryStatus::Supported),
+            ]),
             FeatureClass::RuntimeMutable,
             vec![
                 probe_evidence(
@@ -1872,7 +2268,7 @@ mod tests {
     use std::collections::BTreeSet;
 
     use crate::fs::FixtureFilesystem;
-    use sysboost_core::{CapabilityState, ErrorCode};
+    use sysboost_core::{CapabilityState, CurrentValue, ErrorCode};
     use sysboost_platform::{FileMetadata, FixedClock};
 
     struct FixtureSet {
@@ -2162,6 +2558,54 @@ mod tests {
     }
 
     #[test]
+    fn discovery_report_projects_typed_current_state_with_backend_identity() {
+        let fixture = base_fixture(
+            "fixture",
+            "current-state fixture",
+            &[1024, 1024, 1024, 1024],
+        );
+        let report = CapabilityDiscovery::new(fixture.sources())
+            .discover(&FixedClock::new(Timestamp::from_unix_millis(17)))
+            .expect("fixture discovery succeeds");
+        let current = report
+            .current_state()
+            .expect("current-state projection is deterministic");
+        let governor = current
+            .facts
+            .iter()
+            .find(|fact| fact.control == sysboost_core::ControlId::CpuGovernor)
+            .expect("governor current value is projected");
+        assert!(matches!(governor.value, CurrentValue::Known(_)));
+        assert!(governor
+            .target_identity
+            .is_some_and(|identity| identity.as_bytes() != &[0; 16]));
+        assert_eq!(
+            governor.typed_target,
+            Some(TypedTarget::CpuPolicy(CpuPolicyId::new(0)))
+        );
+    }
+
+    #[test]
+    fn fixture_discovery_can_feed_a_complete_report_only_plan() {
+        let fixture = base_fixture("fixture", "planner fixture", &[1024, 1024, 1024, 1024]);
+        let report = CapabilityDiscovery::new(fixture.sources())
+            .discover(&FixedClock::new(Timestamp::from_unix_millis(18)))
+            .expect("fixture discovery succeeds");
+        let plan = sysboost_core::TypedPlanner::new(sysboost_core::OperationCatalog::empty())
+            .build(&sysboost_core::PlannerInput {
+                policy: sysboost_core::PlannerPolicy::report(sysboost_core::Profile::Balanced),
+                inventory: report.inventory.clone(),
+                current_state: report
+                    .current_state()
+                    .expect("fixture current state is valid"),
+            })
+            .expect("fixture facts produce a complete report-only plan");
+        assert_eq!(plan.profile, Some(sysboost_core::Profile::Balanced));
+        assert!(!plan.items.is_empty());
+        assert!(plan.mutations.is_empty());
+    }
+
+    #[test]
     fn minimal_vm_or_container_is_nonfatal_and_explicitly_sparse() {
         let fixture = minimal_fixture();
         let report = CapabilityDiscovery::new(fixture.sources())
@@ -2260,16 +2704,23 @@ mod tests {
             .findings
             .iter()
             .all(|finding| !finding.evidence.is_empty()));
-        assert!(report
-            .inventory
-            .capabilities
-            .iter()
-            .all(|descriptor| descriptor.state != CapabilityState::Available));
+        assert_eq!(
+            report
+                .inventory
+                .capabilities
+                .iter()
+                .find(
+                    |descriptor| descriptor.id.as_str() == core_capability_ids::CPU_POLICY_GOVERNOR
+                )
+                .expect("governor descriptor exists")
+                .state,
+            CapabilityState::Denied
+        );
     }
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn host_roots_produce_report_only_discovery_without_writes() {
+    fn host_roots_produce_read_only_discovery_without_writes() {
         let roots = HostRoots::open().expect("Linux pseudo-filesystem roots are available");
         let report = CapabilityDiscovery::new(roots.sources())
             .discover(&FixedClock::new(Timestamp::from_unix_millis(16)))
@@ -2281,6 +2732,7 @@ mod tests {
             .inventory
             .capabilities
             .iter()
+            .filter(|descriptor| descriptor.backend.as_str() == super::DISCOVERY_BACKEND)
             .all(|descriptor| descriptor.state != CapabilityState::Available));
     }
 }

@@ -73,6 +73,18 @@ pub enum Request {
     },
 }
 
+impl Request {
+    /// Return the correlation ID without inspecting the request payload.
+    pub const fn request_id(&self) -> RequestId {
+        match self {
+            Self::Prepare { request_id, .. }
+            | Self::Apply { request_id, .. }
+            | Self::Restore { request_id, .. }
+            | Self::Status { request_id, .. } => *request_id,
+        }
+    }
+}
+
 /// Typed helper-to-controller response.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Response {
@@ -457,5 +469,28 @@ mod tests {
     fn oversized_frame_is_rejected_at_protocol_boundary() {
         let oversized = vec![0_u8; MAX_FRAME_BYTES + 1];
         assert!(Request::decode(&oversized).is_err());
+    }
+
+    #[test]
+    fn unknown_operation_or_enum_discriminant_is_rejected() {
+        let mut unknown_request = vec![b'S', b'B', b'P', b'1', 0, 1, 0xff, 0, 0, 0, 8];
+        unknown_request.extend_from_slice(&1_u64.to_be_bytes());
+        assert_eq!(
+            Request::decode(&unknown_request)
+                .expect_err("unknown request operation")
+                .code,
+            ErrorCode::TransportError
+        );
+
+        let mut unknown_state = vec![b'S', b'B', b'P', b'1', 0, 1, 0x82, 0, 0, 0, 25];
+        unknown_state.extend_from_slice(&1_u64.to_be_bytes());
+        unknown_state.extend_from_slice(&[2; 16]);
+        unknown_state.push(0xff);
+        assert_eq!(
+            Response::decode(&unknown_state)
+                .expect_err("unknown session-state enum")
+                .code,
+            ErrorCode::TransportError
+        );
     }
 }

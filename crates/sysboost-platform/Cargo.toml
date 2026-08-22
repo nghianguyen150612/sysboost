@@ -7,7 +7,7 @@ authors.workspace = true
 
 [dependencies]
 sysboost-core = { path = "../sysboost-core" }
+sysboost-protocol = { path = "../sysboost-protocol" }
 
 [lints]
 workspace = true
-

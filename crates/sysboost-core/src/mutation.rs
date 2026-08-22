@@ -79,6 +79,211 @@ impl CgroupId {
     }
 }
 
+/// A process identity discovered from procfs.  The start-time component
+/// prevents a recycled PID from being treated as the original workload.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct ProcessId {
+    pid: u32,
+    start_time_ticks: u64,
+}
+
+impl ProcessId {
+    /// Construct a process identity from enumerated PID/start-time evidence.
+    pub fn new(pid: u32, start_time_ticks: u64) -> Result<Self, SysboostError> {
+        if pid == 0 || start_time_ticks == 0 {
+            return Err(SysboostError::new(
+                ErrorCode::InvalidInput,
+                "process identity requires a positive PID and start time",
+            ));
+        }
+        Ok(Self {
+            pid,
+            start_time_ticks,
+        })
+    }
+
+    /// Return the numeric process ID.
+    pub const fn pid(self) -> u32 {
+        self.pid
+    }
+
+    /// Return the kernel start-time tick value.
+    pub const fn start_time_ticks(self) -> u64 {
+        self.start_time_ticks
+    }
+
+    /// Return the canonical opaque planner target for this process.
+    pub fn target_id(self) -> TargetId {
+        TargetId::new(format!("process.{}.{}", self.pid, self.start_time_ticks))
+            .expect("validated process target is a valid identifier")
+    }
+}
+
+/// A bounded Linux cgroup directory name.  It is a name, never a path.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct CgroupName(String);
+
+impl CgroupName {
+    /// Construct one safe cgroup child name.
+    pub fn new(value: impl Into<String>) -> Result<Self, SysboostError> {
+        let value = value.into();
+        if value.is_empty()
+            || value.len() > 64
+            || value == "."
+            || value == ".."
+            || !value
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(&byte))
+        {
+            return Err(SysboostError::new(
+                ErrorCode::InvalidInput,
+                "cgroup name is not a bounded single component",
+            ));
+        }
+        Ok(Self(value))
+    }
+
+    /// Return the validated child name.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// A Linux nice value.  Runtime control never requests real-time scheduling.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct NiceValue(i8);
+
+impl NiceValue {
+    /// Lowest Linux nice value.
+    pub const MIN: i8 = -20;
+    /// Highest Linux nice value.
+    pub const MAX: i8 = 19;
+
+    /// Construct a bounded nice value.
+    pub fn new(value: i8) -> Result<Self, SysboostError> {
+        if !(Self::MIN..=Self::MAX).contains(&value) {
+            return Err(SysboostError::new(
+                ErrorCode::InvalidInput,
+                "nice value is outside the Linux range",
+            ));
+        }
+        Ok(Self(value))
+    }
+
+    /// Return the numeric nice value.
+    pub const fn get(self) -> i8 {
+        self.0
+    }
+}
+
+/// The conservative I/O-priority classes accepted by workload control.
+/// Realtime I/O priority is intentionally not part of the closed vocabulary.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialOrd, Ord, PartialEq)]
+pub enum IoPriorityClass {
+    /// Let the kernel select the default class.
+    None,
+    /// Best-effort I/O scheduling.
+    BestEffort,
+    /// Idle I/O scheduling.
+    Idle,
+}
+
+/// A bounded Linux I/O priority.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct IoPriority {
+    class: IoPriorityClass,
+    level: u8,
+}
+
+impl IoPriority {
+    /// Construct a non-realtime I/O priority.
+    pub fn new(class: IoPriorityClass, level: u8) -> Result<Self, SysboostError> {
+        if level > 7 {
+            return Err(SysboostError::new(
+                ErrorCode::InvalidInput,
+                "I/O priority level is outside the Linux range",
+            ));
+        }
+        Ok(Self { class, level })
+    }
+
+    /// Return the I/O priority class.
+    pub const fn class(self) -> IoPriorityClass {
+        self.class
+    }
+
+    /// Return the I/O priority level.
+    pub const fn level(self) -> u8 {
+        self.level
+    }
+}
+
+/// A cgroup v2 I/O weight in the Linux-defined range.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct IoWeight(u16);
+
+impl IoWeight {
+    /// Lowest accepted I/O weight.
+    pub const MIN: u16 = 1;
+    /// Highest accepted I/O weight.
+    pub const MAX: u16 = 10_000;
+
+    /// Construct a bounded I/O weight.
+    pub fn new(value: u16) -> Result<Self, SysboostError> {
+        if !(Self::MIN..=Self::MAX).contains(&value) {
+            return Err(SysboostError::new(
+                ErrorCode::InvalidInput,
+                "I/O weight is outside the accepted range",
+            ));
+        }
+        Ok(Self(value))
+    }
+
+    /// Return the numeric I/O weight.
+    pub const fn get(self) -> u16 {
+        self.0
+    }
+}
+
+/// A Linux cgroup utilization-clamp value.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum UclampValue {
+    /// A value in the kernel's 0..=1024 utilization scale.
+    Value(u16),
+    /// The cgroup `max` sentinel, valid for the maximum clamp.
+    Max,
+}
+
+impl UclampValue {
+    /// Construct a finite utilization clamp.
+    pub fn new(value: u16) -> Result<Self, SysboostError> {
+        if value > 1024 {
+            return Err(SysboostError::new(
+                ErrorCode::InvalidInput,
+                "utilization clamp is outside the 0..=1024 range",
+            ));
+        }
+        Ok(Self::Value(value))
+    }
+
+    /// Return the finite value, if this is not `max`.
+    pub const fn get(self) -> Option<u16> {
+        match self {
+            Self::Value(value) => Some(value),
+            Self::Max => None,
+        }
+    }
+}
+
+/// Explicit purpose of a managed cgroup.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum CgroupGroupKind {
+    /// Foreground workload group.
+    Workload,
+    /// Conservative background group.
+    ConservativeBackground,
+}
+
 /// A governor name validated as a bounded semantic identifier.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct GovernorId(String);
@@ -118,6 +323,43 @@ pub enum EnergyPreference {
     BalancePower,
     /// Favor power savings.
     Power,
+}
+
+/// Closed CPU boost/turbo state.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum CpuBoostState {
+    /// Allow the reviewed CPU boost/turbo interface to boost.
+    Enabled,
+    /// Disable the reviewed CPU boost/turbo interface.
+    Disabled,
+}
+
+/// A platform performance-profile identifier returned by the kernel.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct PlatformProfileId(String);
+
+impl PlatformProfileId {
+    /// Construct a bounded semantic platform-profile identifier.
+    pub fn new(value: impl Into<String>) -> Result<Self, SysboostError> {
+        let value = value.into();
+        if value.is_empty()
+            || value.len() > 64
+            || !value
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"._:-".contains(&byte))
+        {
+            return Err(SysboostError::new(
+                ErrorCode::InvalidInput,
+                "platform profile identifier is not a bounded semantic value",
+            ));
+        }
+        Ok(Self(value))
+    }
+
+    /// Return the validated platform-profile name.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
 }
 
 /// A strictly positive CPU frequency in kHz.
@@ -243,6 +485,31 @@ impl CpuSet {
     /// Return the canonical CPU list.
     pub fn as_slice(&self) -> &[u32] {
         &self.0
+    }
+
+    /// Return the number of logical CPUs in the set.
+    pub const fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// Return whether the CPU set has no logical CPUs.
+    pub const fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// Test membership in the canonical CPU set.
+    pub fn contains(&self, cpu: u32) -> bool {
+        self.0.binary_search(&cpu).is_ok()
+    }
+
+    /// Whether every CPU in this set is also present in `other`.
+    pub fn is_subset_of(&self, other: &Self) -> bool {
+        self.0.iter().all(|cpu| other.contains(*cpu))
+    }
+
+    /// Whether the two CPU sets share at least one logical CPU.
+    pub fn intersects(&self, other: &Self) -> bool {
+        self.0.iter().any(|cpu| other.contains(*cpu))
     }
 }
 
@@ -386,6 +653,16 @@ pub enum MutationKind {
         /// Desired preference.
         value: EnergyPreference,
     },
+    /// Host-wide CPU boost/turbo state.
+    CpuBoost {
+        /// Desired boost state.
+        state: CpuBoostState,
+    },
+    /// Host-wide ACPI/platform performance profile.
+    PlatformProfile {
+        /// Desired kernel-advertised profile.
+        profile: PlatformProfileId,
+    },
     /// Existing cgroup CPU weight.
     CgroupCpuWeight {
         /// Cgroup target.
@@ -408,6 +685,65 @@ pub enum MutationKind {
         cgroup: CgroupId,
         /// Desired set.
         cpus: CpuSet,
+    },
+    /// Existing cgroup I/O weight.
+    CgroupIoWeight {
+        /// Cgroup target.
+        cgroup: CgroupId,
+        /// Desired weight.
+        weight: IoWeight,
+    },
+    /// Existing cgroup utilization-clamp minimum.
+    CgroupUclampMin {
+        /// Cgroup target.
+        cgroup: CgroupId,
+        /// Desired clamp.
+        value: UclampValue,
+    },
+    /// Existing cgroup utilization-clamp maximum.
+    CgroupUclampMax {
+        /// Cgroup target.
+        cgroup: CgroupId,
+        /// Desired clamp.
+        value: UclampValue,
+    },
+    /// Create and own a named foreground workload cgroup beneath a validated
+    /// parent.  Restore removes it only after its owned workload is cleaned
+    /// up and the group is proven empty.
+    CgroupWorkload {
+        /// Validated parent cgroup.
+        parent: CgroupId,
+        /// Single-component child name.
+        name: CgroupName,
+    },
+    /// Create and own a named conservative background cgroup beneath a
+    /// validated parent.
+    CgroupBackground {
+        /// Validated parent cgroup.
+        parent: CgroupId,
+        /// Single-component child name.
+        name: CgroupName,
+    },
+    /// Change one explicitly identified process's cgroup placement.
+    ProcessPlacement {
+        /// Process identity including start time.
+        process: ProcessId,
+        /// Existing or transaction-owned destination cgroup.
+        cgroup: CgroupId,
+    },
+    /// Change one explicitly identified process's nice value.
+    ProcessNice {
+        /// Process identity including start time.
+        process: ProcessId,
+        /// Desired nice value.
+        nice: NiceValue,
+    },
+    /// Change one explicitly identified process's conservative I/O priority.
+    ProcessIoPriority {
+        /// Process identity including start time.
+        process: ProcessId,
+        /// Desired I/O priority.
+        priority: IoPriority,
     },
     /// Experimental GPU performance profile.
     GpuPerformanceProfile {
@@ -446,9 +782,19 @@ impl MutationKind {
             Self::CpuFrequency { .. } => "cpu.frequency",
             Self::CpuGovernor { .. } => "cpu.governor",
             Self::CpuEnergyPreference { .. } => "cpu.energy_preference",
+            Self::CpuBoost { .. } => "cpu.boost",
+            Self::PlatformProfile { .. } => "platform.profile",
             Self::CgroupCpuWeight { .. } => "cgroup.cpu.weight",
             Self::CgroupCpuMax { .. } => "cgroup.cpu.max",
             Self::CgroupCpuset { .. } => "cgroup.cpuset.cpus",
+            Self::CgroupIoWeight { .. } => "cgroup.io.weight",
+            Self::CgroupUclampMin { .. } => "cgroup.uclamp.min",
+            Self::CgroupUclampMax { .. } => "cgroup.uclamp.max",
+            Self::CgroupWorkload { .. } => "cgroup.workload",
+            Self::CgroupBackground { .. } => "cgroup.background",
+            Self::ProcessPlacement { .. } => "scheduler.process.placement",
+            Self::ProcessNice { .. } => "scheduler.nice",
+            Self::ProcessIoPriority { .. } => "scheduler.ioprio",
             Self::GpuPerformanceProfile { .. } => "gpu.performance.profile",
             Self::GpuPowerLimit { .. } => "gpu.power.limit",
             Self::IrqAffinity { .. } => "irq.affinity",
@@ -468,12 +814,31 @@ impl MutationKind {
             },
             Self::CpuGovernor { governor, .. } => TypedValue::Governor(governor.clone()),
             Self::CpuEnergyPreference { value, .. } => TypedValue::EnergyPreference(*value),
+            Self::CpuBoost { state } => TypedValue::CpuBoost(*state),
+            Self::PlatformProfile { profile } => TypedValue::PlatformProfile(profile.clone()),
             Self::CgroupCpuWeight { weight, .. } => TypedValue::CgroupCpuWeight(*weight),
             Self::CgroupCpuMax { quota, period, .. } => TypedValue::CgroupCpuMax {
                 quota: *quota,
                 period: *period,
             },
             Self::CgroupCpuset { cpus, .. } => TypedValue::CgroupCpuset(cpus.clone()),
+            Self::CgroupIoWeight { weight, .. } => TypedValue::CgroupIoWeight(*weight),
+            Self::CgroupUclampMin { value, .. } | Self::CgroupUclampMax { value, .. } => {
+                TypedValue::CgroupUclamp(*value)
+            }
+            Self::CgroupWorkload { name, .. } => TypedValue::CgroupLifecycle {
+                kind: CgroupGroupKind::Workload,
+                name: name.clone(),
+                present: true,
+            },
+            Self::CgroupBackground { name, .. } => TypedValue::CgroupLifecycle {
+                kind: CgroupGroupKind::ConservativeBackground,
+                name: name.clone(),
+                present: true,
+            },
+            Self::ProcessPlacement { cgroup, .. } => TypedValue::ProcessPlacement(cgroup.clone()),
+            Self::ProcessNice { nice, .. } => TypedValue::Nice(*nice),
+            Self::ProcessIoPriority { priority, .. } => TypedValue::IoPriority(*priority),
             Self::GpuPerformanceProfile { profile, .. } => {
                 TypedValue::GpuPerformanceProfile(*profile)
             }
@@ -488,6 +853,18 @@ impl MutationKind {
 
     fn validate(&self) -> Result<(), SysboostError> {
         if let Self::CpuFrequency {
+            min_khz: None,
+            max_khz: None,
+            ..
+        } = self
+        {
+            return Err(SysboostError::new(
+                ErrorCode::PlanningError,
+                "CPU frequency mutation must select a minimum or maximum",
+            )
+            .with_stage(Stage::Plan));
+        }
+        if let Self::CpuFrequency {
             min_khz: Some(min),
             max_khz: Some(max),
             ..
@@ -500,6 +877,17 @@ impl MutationKind {
                 )
                 .with_stage(Stage::Plan));
             }
+        }
+        if let Self::CgroupUclampMin {
+            value: UclampValue::Max,
+            ..
+        } = self
+        {
+            return Err(SysboostError::new(
+                ErrorCode::PlanningError,
+                "cgroup uclamp.min cannot use the max sentinel",
+            )
+            .with_stage(Stage::Plan));
         }
         Ok(())
     }
@@ -519,6 +907,10 @@ pub enum TypedValue {
     Governor(GovernorId),
     /// Energy preference.
     EnergyPreference(EnergyPreference),
+    /// CPU boost/turbo state.
+    CpuBoost(CpuBoostState),
+    /// Platform performance profile.
+    PlatformProfile(PlatformProfileId),
     /// Cgroup weight.
     CgroupCpuWeight(CpuWeight),
     /// Cgroup quota and period.
@@ -530,6 +922,25 @@ pub enum TypedValue {
     },
     /// Cgroup CPU set.
     CgroupCpuset(CpuSet),
+    /// Cgroup I/O weight.
+    CgroupIoWeight(IoWeight),
+    /// Cgroup utilization clamp.
+    CgroupUclamp(UclampValue),
+    /// Managed cgroup lifecycle state.
+    CgroupLifecycle {
+        /// Purpose of the managed group.
+        kind: CgroupGroupKind,
+        /// Child name.
+        name: CgroupName,
+        /// Whether the group exists.
+        present: bool,
+    },
+    /// Process cgroup placement.
+    ProcessPlacement(CgroupId),
+    /// Process nice value.
+    Nice(NiceValue),
+    /// Process I/O priority.
+    IoPriority(IoPriority),
     /// GPU profile.
     GpuPerformanceProfile(GpuProfile),
     /// GPU power limit.

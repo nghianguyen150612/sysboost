@@ -4,6 +4,7 @@ use crate::capability::{CapabilityInventory, RiskClass};
 use crate::error::{ErrorCode, Stage, SysboostError};
 use crate::ids::{CapabilityId, MutationId, PlanId, TargetId};
 use crate::mutation::{MutationKind, PlannedMutation};
+use crate::planner::{PlanItem, Profile};
 
 /// Runtime mode selected by policy.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -101,6 +102,11 @@ pub struct Plan {
     pub capability_digest: [u8; 32],
     /// Topologically ordered mutation units.
     pub mutations: Vec<PlannedMutation>,
+    /// All explainable decisions, including non-executable entries.
+    pub items: Vec<PlanItem>,
+    /// Profile used to resolve this plan, when the plan came from the typed
+    /// profile resolver rather than the legacy mutation-only constructor.
+    pub profile: Option<Profile>,
 }
 
 impl Plan {
@@ -118,14 +124,80 @@ impl Plan {
             policy_digest,
             capability_digest,
             mutations,
+            items: Vec::new(),
+            profile: None,
         };
         plan.validate()?;
         Ok(plan)
     }
 
-    /// Validate uniqueness and dependency references. A later planner may add
-    /// a full topological sort, but no malformed dependency graph is accepted.
+    /// Construct a complete plan from explainable decisions.
+    pub fn from_items(
+        id: PlanId,
+        plan_digest: [u8; 32],
+        policy_digest: [u8; 32],
+        capability_digest: [u8; 32],
+        profile: Profile,
+        items: Vec<PlanItem>,
+    ) -> Result<Self, SysboostError> {
+        let mut mutations: Vec<PlannedMutation> = items
+            .iter()
+            .filter_map(|item| item.mutation.clone())
+            .collect();
+        mutations.sort_by_key(|mutation| mutation.mutation_id);
+        let plan = Self {
+            id,
+            plan_digest,
+            policy_digest,
+            capability_digest,
+            mutations,
+            items,
+            profile: Some(profile),
+        };
+        plan.validate_complete()?;
+        Ok(plan)
+    }
+
+    /// Validate decisions, uniqueness, dependency references, and dependency
+    /// order. Malformed or contradictory plans are rejected fail-closed.
     pub fn validate(&self) -> Result<(), SysboostError> {
+        if !self.items.is_empty() {
+            for item in &self.items {
+                item.validate()?;
+            }
+            let mut item_mutations = self
+                .items
+                .iter()
+                .filter_map(|item| item.mutation.clone())
+                .collect::<Vec<_>>();
+            item_mutations.sort_by_key(|mutation| mutation.mutation_id);
+            if item_mutations != self.mutations {
+                return Err(SysboostError::new(
+                    ErrorCode::PlanningError,
+                    "plan mutation set does not match its executable decision items",
+                )
+                .with_stage(Stage::Plan));
+            }
+
+            for (index, item) in self.items.iter().enumerate() {
+                if item.action.is_executable() {
+                    if let (Some(target), control) = (item.target.as_ref(), item.control) {
+                        if self.items[..index].iter().any(|previous| {
+                            previous.action.is_executable()
+                                && previous.target.as_ref() == Some(target)
+                                && previous.control == control
+                        }) {
+                            return Err(SysboostError::new(
+                                ErrorCode::PlanningError,
+                                "plan contains conflicting mutations for one target control",
+                            )
+                            .with_stage(Stage::Plan));
+                        }
+                    }
+                }
+            }
+        }
+
         for (index, mutation) in self.mutations.iter().enumerate() {
             if self.mutations[..index]
                 .iter()
@@ -139,6 +211,20 @@ impl Plan {
                 .with_mutation(mutation.mutation_id));
             }
             for dependency in &mutation.dependencies {
+                if mutation
+                    .dependencies
+                    .iter()
+                    .filter(|candidate| *candidate == dependency)
+                    .count()
+                    > 1
+                {
+                    return Err(SysboostError::new(
+                        ErrorCode::PlanningError,
+                        "plan contains a duplicate mutation dependency",
+                    )
+                    .with_stage(Stage::Plan)
+                    .with_mutation(mutation.mutation_id));
+                }
                 if !self
                     .mutations
                     .iter()
@@ -164,7 +250,41 @@ impl Plan {
                 .with_mutation(mutation.mutation_id));
             }
         }
+        for (index, mutation) in self.mutations.iter().enumerate() {
+            for dependency in &mutation.dependencies {
+                let dependency_index = self
+                    .mutations
+                    .iter()
+                    .position(|candidate| candidate.mutation_id == *dependency)
+                    .expect("dependency existence was checked above");
+                if dependency_index >= index {
+                    return Err(SysboostError::new(
+                        ErrorCode::PlanningError,
+                        "plan dependency appears after the mutation that requires it",
+                    )
+                    .with_stage(Stage::Plan)
+                    .with_mutation(mutation.mutation_id));
+                }
+            }
+        }
         Ok(())
+    }
+
+    /// Validate that this plan uses the complete Prompt 4 decision model.
+    ///
+    /// The older mutation-only constructor remains available for the frozen
+    /// foundation and transaction-contract tests.  A plan entering the typed
+    /// planner/transaction admission path must contain decision items so that
+    /// contract, evidence, and rationale metadata can be checked.
+    pub fn validate_complete(&self) -> Result<(), SysboostError> {
+        if self.items.is_empty() && !self.mutations.is_empty() {
+            return Err(SysboostError::new(
+                ErrorCode::PlanningError,
+                "complete plan validation requires explainable decision items",
+            )
+            .with_stage(Stage::Plan));
+        }
+        self.validate()
     }
 }
 
@@ -227,6 +347,73 @@ mod tests {
             [4; 32],
             vec![mutation],
         );
+        assert_eq!(result.unwrap_err().code, ErrorCode::PlanningError);
+    }
+
+    fn mutation(id: u32, dependencies: Vec<MutationId>) -> PlannedMutation {
+        let kind = MutationKind::CpuGovernor {
+            policy: CpuPolicyId::new(id),
+            governor: GovernorId::new("performance").expect("valid governor"),
+        };
+        PlannedMutation::new(
+            MutationId::new(id),
+            CapabilityId::new("cpu.policy.governor").expect("valid capability"),
+            TargetId::new(format!("cpu.policy.{id}")).expect("valid target"),
+            kind.clone(),
+            kind.typed_value(),
+            StateFingerprint::from_bytes([id as u8; 32]),
+            EqualityKind::ScalarExact,
+            dependencies,
+        )
+        .expect("fixture mutation is structurally valid")
+    }
+
+    fn plan_with(mutations: Vec<PlannedMutation>) -> Result<Plan, SysboostError> {
+        Plan::new(
+            PlanId::from_bytes([1; 16]),
+            [2; 32],
+            [3; 32],
+            [4; 32],
+            mutations,
+        )
+    }
+
+    #[test]
+    fn plan_accepts_dependencies_in_topological_order() {
+        let plan = plan_with(vec![
+            mutation(1, Vec::new()),
+            mutation(2, vec![MutationId::new(1)]),
+        ])
+        .expect("valid dependency graph");
+        assert_eq!(plan.mutations[1].dependencies, vec![MutationId::new(1)]);
+    }
+
+    #[test]
+    fn plan_rejects_duplicate_dependencies() {
+        let result = plan_with(vec![
+            mutation(1, Vec::new()),
+            mutation(2, vec![MutationId::new(1), MutationId::new(1)]),
+        ]);
+        assert_eq!(result.unwrap_err().code, ErrorCode::PlanningError);
+    }
+
+    #[test]
+    fn plan_rejects_dependency_cycles() {
+        let result = plan_with(vec![
+            mutation(1, vec![MutationId::new(2)]),
+            mutation(2, vec![MutationId::new(1)]),
+        ]);
+        let error = result.expect_err("cycle must be rejected");
+        assert_eq!(error.code, ErrorCode::PlanningError);
+        assert!(error.message.contains("dependency graph contains a cycle"));
+    }
+
+    #[test]
+    fn plan_rejects_dependency_that_is_present_but_out_of_order() {
+        let result = plan_with(vec![
+            mutation(2, vec![MutationId::new(1)]),
+            mutation(1, Vec::new()),
+        ]);
         assert_eq!(result.unwrap_err().code, ErrorCode::PlanningError);
     }
 }

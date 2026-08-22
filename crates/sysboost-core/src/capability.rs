@@ -27,6 +27,36 @@ pub mod ids {
     pub const IRQ_AFFINITY: &str = "irq.affinity";
     /// Reviewed runtime sysctl family.
     pub const KERNEL_SYSCTL_RUNTIME: &str = "kernel.sysctl.runtime";
+    /// CPU boost/turbo interface.
+    pub const CPU_BOOST: &str = "cpu.policy.boost";
+    /// ACPI/platform performance profile interface.
+    pub const PLATFORM_PROFILE: &str = "platform.profile";
+    /// Transparent huge-page interface.
+    pub const MEMORY_THP: &str = "memory.thp";
+    /// Scheduler and workload policy facilities.
+    pub const SCHEDULER: &str = "scheduler.facilities";
+    /// Cgroup utilization-clamp interface.
+    pub const CGROUP_UCLAMP: &str = "cgroup.uclamp";
+    /// Cgroup I/O weight.
+    pub const CGROUP_IO_WEIGHT: &str = "cgroup.io.weight";
+    /// Managed foreground workload cgroup.
+    pub const CGROUP_WORKLOAD: &str = "cgroup.workload";
+    /// Managed conservative background cgroup.
+    pub const CGROUP_BACKGROUND: &str = "cgroup.background";
+    /// Explicit process placement.
+    pub const PROCESS_PLACEMENT: &str = "scheduler.process.placement";
+    /// Explicit process nice value.
+    pub const PROCESS_NICE: &str = "scheduler.nice";
+    /// Explicit process I/O priority.
+    pub const PROCESS_IOPRIO: &str = "scheduler.ioprio";
+    /// Child-process supervision hook.
+    pub const CHILD_SUPERVISION: &str = "scheduler.child.supervision";
+    /// CPU topology observation.
+    pub const CPU_TOPOLOGY: &str = "cpu.topology";
+    /// Heterogeneous CPU capacity observation.
+    pub const CPU_CAPACITY: &str = "cpu.capacity";
+    /// NUMA topology observation.
+    pub const NUMA_TOPOLOGY: &str = "memory.numa";
 }
 
 /// Runtime availability state of a capability.
@@ -97,8 +127,13 @@ pub enum RiskClass {
 pub enum TargetKind {
     /// CPUFreq policy target.
     CpuPolicy,
+    /// Host-wide CPU control target whose interface is still a typed,
+    /// backend-owned allowlist entry.
+    CpuSystem,
     /// Existing cgroup target.
     Cgroup,
+    /// Explicit process target identified by PID and start time.
+    Process,
     /// GPU device target.
     Gpu,
     /// IRQ target.
@@ -127,7 +162,7 @@ pub enum EvidenceSource {
 }
 
 /// A bounded piece of evidence explaining a capability state.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct CapabilityEvidence {
     /// Evidence source family.
     pub source: EvidenceSource,

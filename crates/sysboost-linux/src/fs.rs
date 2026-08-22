@@ -4,10 +4,13 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use sysboost_core::{ErrorCode, SysboostError};
+use sysboost_core::{ErrorCode, SysboostError, TargetIdentity};
 use sysboost_platform::{
     DirectoryEntry, EntryKind, FileMetadata, ReadOnlyFileSystem, RelativePath,
 };
+
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
 
 /// Read-only adapter rooted at one explicitly selected mount/fixture.
 #[derive(Clone, Debug)]
@@ -94,6 +97,25 @@ impl ReadOnlyFileSystem for RootedFilesystem {
             len: metadata.len(),
             read_only: metadata.permissions().readonly(),
         })
+    }
+
+    fn identity(&self, path: &RelativePath) -> Result<TargetIdentity, SysboostError> {
+        let resolved = self.resolve_existing(path)?;
+        let metadata = fs::symlink_metadata(resolved).map_err(|error| {
+            SysboostError::new(
+                ErrorCode::CapabilityError,
+                format!("cannot read adapter identity: {error}"),
+            )
+        })?;
+        if metadata.file_type().is_symlink()
+            || (!metadata.file_type().is_file() && !metadata.file_type().is_dir())
+        {
+            return Err(SysboostError::new(
+                ErrorCode::TargetError,
+                "adapter identity target has an unexpected type",
+            ));
+        }
+        Ok(target_identity_from_metadata(&metadata))
     }
 
     fn list(&self, path: Option<&RelativePath>) -> Result<Vec<DirectoryEntry>, SysboostError> {
@@ -216,6 +238,23 @@ impl ReadOnlyFileSystem for FixtureFilesystem {
             .ok_or_else(|| SysboostError::new(ErrorCode::TargetError, "fixture node is missing"))
     }
 
+    fn identity(&self, path: &RelativePath) -> Result<TargetIdentity, SysboostError> {
+        if self.files.contains_key(path)
+            || self.files.keys().any(|candidate| {
+                candidate
+                    .as_str()
+                    .starts_with(&format!("{}/", path.as_str()))
+            })
+        {
+            Ok(fixture_target_identity(path))
+        } else {
+            Err(SysboostError::new(
+                ErrorCode::TargetError,
+                "fixture identity target is missing",
+            ))
+        }
+    }
+
     fn list(&self, path: Option<&RelativePath>) -> Result<Vec<DirectoryEntry>, SysboostError> {
         let prefix = path.map(RelativePath::as_str);
         let mut entries = BTreeMap::new();
@@ -264,6 +303,38 @@ impl ReadOnlyFileSystem for FixtureFilesystem {
             .map(|(name, kind)| DirectoryEntry { name, kind })
             .collect())
     }
+}
+
+/// Deterministic identity evidence for an in-memory fixture node.
+pub fn fixture_target_identity(path: &RelativePath) -> TargetIdentity {
+    let mut lanes = [0xcbf29ce484222325_u64, 0x84222325cbf29ce4_u64];
+    for (index, byte) in path.as_str().bytes().enumerate() {
+        let lane = index % lanes.len();
+        lanes[lane] ^= u64::from(byte);
+        lanes[lane] = lanes[lane]
+            .wrapping_mul(0x100000001b3)
+            .rotate_left(((index % 63) + 1) as u32);
+    }
+    let mut bytes = [0_u8; 16];
+    bytes[..8].copy_from_slice(&lanes[0].to_be_bytes());
+    bytes[8..].copy_from_slice(&lanes[1].to_be_bytes());
+    TargetIdentity::from_bytes(bytes)
+}
+
+#[cfg(unix)]
+fn target_identity_from_metadata(metadata: &fs::Metadata) -> TargetIdentity {
+    let mut bytes = [0_u8; 16];
+    bytes[..8].copy_from_slice(&metadata.dev().to_be_bytes());
+    bytes[8..].copy_from_slice(&metadata.ino().to_be_bytes());
+    TargetIdentity::from_bytes(bytes)
+}
+
+#[cfg(not(unix))]
+fn target_identity_from_metadata(metadata: &fs::Metadata) -> TargetIdentity {
+    fixture_target_identity(
+        &RelativePath::new(format!("metadata:{}", metadata.len()))
+            .expect("static identity fixture path is valid"),
+    )
 }
 
 #[cfg(test)]

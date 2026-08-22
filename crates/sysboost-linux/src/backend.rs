@@ -4,7 +4,7 @@ use sysboost_core::{
     ApplyReceipt, CapabilityInventory, ErrorCode, PlannedMutation, RestoreReceipt, Snapshot,
     StateFingerprint, SysboostError, Timestamp,
 };
-use sysboost_platform::{BackendDescriptor, Clock, MutationBackend};
+use sysboost_platform::{BackendDescriptor, BackendExecutionToken, Clock, MutationBackend};
 
 /// A compiled-in backend that advertises no mutations and always remains
 /// report-only. It proves the registry/trait shape without touching hardware.
@@ -48,6 +48,7 @@ impl MutationBackend for ReportOnlyBackend {
 
     fn snapshot(
         &self,
+        _execution: &BackendExecutionToken,
         _mutation: &PlannedMutation,
         _now: Timestamp,
     ) -> Result<Snapshot, SysboostError> {
@@ -56,6 +57,7 @@ impl MutationBackend for ReportOnlyBackend {
 
     fn apply(
         &self,
+        _execution: &BackendExecutionToken,
         _mutation: &PlannedMutation,
         _snapshot: &Snapshot,
     ) -> Result<ApplyReceipt, SysboostError> {
@@ -64,16 +66,20 @@ impl MutationBackend for ReportOnlyBackend {
 
     fn verify(
         &self,
+        _execution: &BackendExecutionToken,
         _mutation: &PlannedMutation,
         _expected: StateFingerprint,
+        _expected_target_identity: sysboost_core::TargetIdentity,
     ) -> Result<StateFingerprint, SysboostError> {
         Err(unsupported())
     }
 
     fn restore(
         &self,
+        _execution: &BackendExecutionToken,
         _mutation: &PlannedMutation,
         _snapshot: &Snapshot,
+        _expected_ownership: StateFingerprint,
     ) -> Result<RestoreReceipt, SysboostError> {
         Err(unsupported())
     }
